@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const { execFile, spawn } = require('child_process');
-const { createCanvas } = require('canvas');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
