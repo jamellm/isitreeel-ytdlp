@@ -1,198 +1,110 @@
 const express = require('express');
+const cors = require('cors');
+const { execFile, spawn } = require('child_process');
+const fs = require('fs');
 const path = require('path');
-const https = require('https');
-const http = require('http');
+const os = require('os');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 
-// Stripe Price IDs
-const STRIPE_PRICES = {
-  light: 'price_1TRYmzDhFdEbgvvOSIcb4rWP',
-  founding: 'price_1TRYo5DhFdEbgvvOgnUPzgM4',
-  pro: 'price_1TRYp4DhFdEbgvvO8u5awui6',
-};
+// Allow requests from isitreelapp.com
+app.use(cors({
+  origin: ['https://isitreelapp.com', 'http://localhost:3000'],
+  methods: ['POST', 'GET'],
+}));
 
-const RAILWAY_URL = 'https://isitreeel-ytdlp-production.up.railway.app';
+app.use(express.json());
 
-app.use(express.json({ limit: '50mb' }));
-app.use(express.static(path.join(__dirname, 'dist')));
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', service: 'isitreeel-ytdlp' });
+});
 
-// ── RAILWAY URL EXTRACTION ──────────────────────────────────────────────────
-app.post('/api/extract-url', function(req, res) {
-  var url = req.body.url;
+// Extract frames from a URL
+app.post('/extract', async (req, res) => {
+  const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL required' });
 
-  var body = JSON.stringify({ url: url });
+  // Validate URL is from supported platform
+  const supported = ['youtube.com', 'youtu.be', 'tiktok.com', 'facebook.com', 'fb.watch', 'instagram.com', 'twitter.com', 'x.com'];
+  const isSupported = supported.some(domain => url.includes(domain));
+  if (!isSupported) return res.status(400).json({ error: 'Unsupported platform. Try YouTube, TikTok, Facebook, Instagram, or X.' });
 
-  var options = {
-    hostname: 'isitreeel-ytdlp-production.up.railway.app',
-    port: 443,
-    path: '/extract',
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(body),
-    },
-  };
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'isitreeel-'));
+  const videoPath = path.join(tmpDir, 'video.mp4');
+  const framesDir = path.join(tmpDir, 'frames');
+  fs.mkdirSync(framesDir);
 
-  var https = require('https');
-  var proxyReq = https.request(options, function(proxyRes) {
-    var data = '';
-    proxyRes.on('data', function(chunk) { data += chunk; });
-    proxyRes.on('end', function() {
-      try { res.status(proxyRes.statusCode).json(JSON.parse(data)); }
-      catch(e) { res.status(500).json({ error: 'Failed to parse response' }); }
+  try {
+    // Step 1: Download video with yt-dlp
+    await new Promise((resolve, reject) => {
+      const ytdlp = spawn('yt-dlp', [
+        '--no-playlist',
+        '--max-filesize', '100m',
+        '-f', 'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best',
+        '--merge-output-format', 'mp4',
+        '-o', videoPath,
+        '--no-warnings',
+        url
+      ]);
+
+      let stderr = '';
+      ytdlp.stderr.on('data', (data) => { stderr += data.toString(); });
+      ytdlp.on('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error('Download failed: ' + stderr.slice(-200)));
+      });
+      ytdlp.on('error', reject);
+
+      // Timeout after 60 seconds
+      setTimeout(() => { ytdlp.kill(); reject(new Error('Download timeout')); }, 60000);
     });
-  });
-  proxyReq.on('error', function(err) {
-    res.status(500).json({ error: 'Video download failed: ' + err.message });
-  });
-  proxyReq.write(body);
-  proxyReq.end();
-});
 
-// ── ANTHROPIC PROXY ──────────────────────────────────────────────────────────
-app.post('/api/analyze', function(req, res) {
-  var apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'API key not configured' });
-
-  var body = JSON.stringify(req.body);
-  var options = {
-    hostname: 'api.anthropic.com',
-    port: 443,
-    path: '/v1/messages',
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-      'Content-Length': Buffer.byteLength(body),
-    },
-  };
-
-  var proxyReq = https.request(options, function(proxyRes) {
-    var data = '';
-    proxyRes.on('data', function(chunk) { data += chunk; });
-    proxyRes.on('end', function() {
-      try { res.status(proxyRes.statusCode).json(JSON.parse(data)); }
-      catch(e) { res.status(proxyRes.statusCode).send(data); }
+    // Step 2: Extract 6 frames using ffmpeg
+    await new Promise((resolve, reject) => {
+      execFile('ffmpeg', [
+        '-i', videoPath,
+        '-vf', 'fps=1/3,scale=640:-2',
+        '-frames:v', '6',
+        '-q:v', '3',
+        path.join(framesDir, 'frame%d.jpg'),
+        '-y'
+      ], (err, stdout, stderr) => {
+        if (err) reject(new Error('Frame extraction failed'));
+        else resolve();
+      });
     });
-  });
-  proxyReq.on('error', function(err) { res.status(500).json({ error: err.message }); });
-  proxyReq.write(body);
-  proxyReq.end();
-});
 
-// ── STRIPE CHECKOUT ──────────────────────────────────────────────────────────
-app.post('/api/checkout', function(req, res) {
-  var stripeKey = process.env.STRIPE_SECRET_KEY;
-  if (!stripeKey) return res.status(500).json({ error: 'Stripe not configured' });
+    // Step 3: Read frames and convert to base64
+    const frameFiles = fs.readdirSync(framesDir)
+      .filter(f => f.endsWith('.jpg'))
+      .sort()
+      .slice(0, 6);
 
-  var tier = req.body.tier;
-  var priceId = STRIPE_PRICES[tier];
-  if (!priceId) return res.status(400).json({ error: 'Invalid tier' });
+    if (frameFiles.length === 0) {
+      return res.status(500).json({ error: 'No frames could be extracted from this video' });
+    }
 
-  var origin = req.headers.origin || 'https://isitreelapp.com';
-  var checkoutData = JSON.stringify({
-    mode: 'subscription',
-    line_items: [{ price: priceId, quantity: 1 }],
-    success_url: origin + '?upgraded=true&tier=' + tier,
-    cancel_url: origin + '?cancelled=true',
-    allow_promotion_codes: true,
-  });
-
-  var options = {
-    hostname: 'api.stripe.com',
-    port: 443,
-    path: '/v1/checkout/sessions',
-    method: 'POST',
-    headers: {
-      'Authorization': 'Bearer ' + stripeKey,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-  };
-
-  // Build form-encoded body for Stripe
-  var formBody = 'mode=subscription'
-    + '&line_items[0][price]=' + priceId
-    + '&line_items[0][quantity]=1'
-    + '&success_url=' + encodeURIComponent(origin + '?upgraded=true&tier=' + tier)
-    + '&cancel_url=' + encodeURIComponent(origin + '?cancelled=true')
-    + '&allow_promotion_codes=true';
-
-  options.headers['Content-Length'] = Buffer.byteLength(formBody);
-
-  var stripeReq = https.request(options, function(stripeRes) {
-    var data = '';
-    stripeRes.on('data', function(chunk) { data += chunk; });
-    stripeRes.on('end', function() {
-      try {
-        var parsed = JSON.parse(data);
-        res.json({ url: parsed.url, error: parsed.error });
-      } catch(e) {
-        res.status(500).json({ error: 'Stripe response error' });
-      }
+    const frames = frameFiles.map(f => {
+      const data = fs.readFileSync(path.join(framesDir, f));
+      return data.toString('base64');
     });
-  });
-  stripeReq.on('error', function(err) { res.status(500).json({ error: err.message }); });
-  stripeReq.write(formBody);
-  stripeReq.end();
+
+    // Get video title/filename for analysis
+    let title = 'video from ' + new URL(url).hostname;
+
+    res.json({ frames, title, count: frames.length });
+
+  } catch (err) {
+    console.error('Extraction error:', err.message);
+    res.status(500).json({ error: err.message || 'Failed to process video' });
+  } finally {
+    // Cleanup temp files
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
+  }
 });
 
-// ── STRIPE WEBHOOK (verify subscription) ────────────────────────────────────
-app.post('/api/verify-session', function(req, res) {
-  var stripeKey = process.env.STRIPE_SECRET_KEY;
-  var sessionId = req.body.sessionId;
-  if (!stripeKey || !sessionId) return res.status(400).json({ error: 'Missing params' });
-
-  var options = {
-    hostname: 'api.stripe.com',
-    port: 443,
-    path: '/v1/checkout/sessions/' + sessionId,
-    method: 'GET',
-    headers: { 'Authorization': 'Bearer ' + stripeKey },
-  };
-
-  var stripeReq = https.request(options, function(stripeRes) {
-    var data = '';
-    stripeRes.on('data', function(chunk) { data += chunk; });
-    stripeRes.on('end', function() {
-      try {
-        var session = JSON.parse(data);
-        var tier = 'free';
-        var priceId = session.line_items && session.line_items.data && session.line_items.data[0] && session.line_items.data[0].price && session.line_items.data[0].price.id;
-        if (priceId === STRIPE_PRICES.pro) tier = 'pro';
-        else if (priceId === STRIPE_PRICES.founding) tier = 'founding';
-        else if (priceId === STRIPE_PRICES.light) tier = 'light';
-        res.json({ tier, email: session.customer_details && session.customer_details.email });
-      } catch(e) {
-        res.status(500).json({ error: 'Parse error' });
-      }
-    });
-  });
-  stripeReq.on('error', function(err) { res.status(500).json({ error: err.message }); });
-  stripeReq.end();
+app.listen(PORT, () => {
+  console.log(`IsItReel yt-dlp service running on port ${PORT}`);
 });
-
-// ── HEALTH CHECK ─────────────────────────────────────────────────────────────
-app.get('/api/health', function(req, res) {
-  var apiKey = process.env.ANTHROPIC_API_KEY;
-  var stripeKey = process.env.STRIPE_SECRET_KEY;
-  res.json({
-    status: 'ok',
-    hasAnthropicKey: !!apiKey,
-    hasStripeKey: !!stripeKey,
-    keyPrefix: apiKey ? apiKey.substring(0, 15) + '...' : 'MISSING'
-  });
-});
-
-// ── CLIENT ROUTING ───────────────────────────────────────────────────────────
-app.get('*', function(req, res) {
-  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
-});
-
-app.listen(PORT, function() {
-  console.log('IsItReel running on port ' + PORT);
-});
-
