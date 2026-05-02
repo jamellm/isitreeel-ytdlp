@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install yt-dlp
-RUN pip install yt-dlp
+RUN pip install --upgrade yt-dlp
 
 WORKDIR /app
 
